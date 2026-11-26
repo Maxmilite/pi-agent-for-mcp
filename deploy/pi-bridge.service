@@ -1,0 +1,34 @@
+[Unit]
+Description=pi-bridge relay (lets a remote MCP client drive a local pi session)
+Documentation=https://github.com/Maxmilite/pi-agent-for-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi-bridge
+Group=pi-bridge
+WorkingDirectory=/opt/pi-bridge
+EnvironmentFile=/etc/pi-bridge/pi-bridge.env
+ExecStart=/usr/bin/node /opt/pi-bridge/server/index.mjs
+Restart=always
+RestartSec=3
+UMask=0077
+
+StateDirectory=pi-bridge
+RuntimeDirectory=pi-bridge
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/pi-bridge
+
+[Install]
+WantedBy=multi-user.target

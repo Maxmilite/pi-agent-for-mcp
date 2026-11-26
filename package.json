@@ -1,20 +1,44 @@
 {
   "name": "pi-bridge",
   "version": "0.1.0",
-  "description": "Let a remote MCP client (ChatGPT) drive a local Pi session: /connect in pi, then pi_ask / pi_exec / pi_read from the other side.",
+  "description": "Let a remote MCP client (ChatGPT) drive a local pi coding agent: /connect in pi, then pi_ask, pi_exec and friends from the other side.",
   "type": "module",
-  "engines": {
-    "node": ">=20.0.0"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Maxmilite/pi-agent-for-mcp.git"
   },
+  "bugs": {
+    "url": "https://github.com/Maxmilite/pi-agent-for-mcp/issues"
+  },
+  "homepage": "https://github.com/Maxmilite/pi-agent-for-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "pi",
+    "coding-agent",
+    "chatgpt",
+    "oauth",
+    "reverse-tunnel"
+  ],
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "files": [
+    "server",
+    "extension",
+    "deploy",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node server/index.mjs",
     "dev": "node --watch server/index.mjs",
-    "test": "node --test test/"
+    "test": "node --test --test-force-exit test/"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
     "express": "^4.21.2",
     "zod": "^3.24.1"
-  },
-  "license": "MIT"
+  }
 }

@@ -1,0 +1,5 @@
+{
+  "url": "https://pi.example.com",
+  "token": "the AGENT_TOKEN from /etc/pi-bridge/pi-bridge.env",
+  "agent": "laptop"
+}
