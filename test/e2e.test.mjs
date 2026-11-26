@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -50,6 +50,7 @@ const textOf = (result) => (result.content ?? []).map((b) => b.text ?? '').join(
 
 /** A stand-in for the pi runtime: records registrations, plays back a canned turn. */
 function fakePi({ reply = 'the answer is 42', delayMs = 0, toolCalls = [] } = {}) {
+  const calls = { compact: [], navigate: [] };
   const handlers = new Map();
   const commands = new Map();
   const sent = [];
@@ -58,11 +59,32 @@ function fakePi({ reply = 'the answer is 42', delayMs = 0, toolCalls = [] } = {}
     for (const fn of [...(handlers.get(event) ?? [])]) await fn(payload, ctx);
   };
 
+  const entries = [
+    { id: 'e1', type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'look at the failing test' }] } },
+    { id: 'e2', type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'the assertion is wrong' }] } },
+  ];
+
   const ctx = {
     hasUI: true,
     model: { provider: 'fake', id: 'fake-model' },
     isIdle: () => true,
     abort: () => {},
+    getContextUsage: () => ({ tokens: 68000, contextWindow: 128000, percent: 53 }),
+    sessionManager: {
+      getSessionFile: () => '/tmp/fake-session.jsonl',
+      getEntryCount: () => entries.length,
+      getLeafId: () => 'e2',
+      getBranch: () => entries,
+      getTree: () => [{ entry: entries[0], children: [{ entry: entries[1], children: [] }] }],
+    },
+    compact(options) {
+      calls.compact.push(options);
+      setTimeout(() => options.onComplete({ summary: 'the test expects 3 but gets 4', tokensBefore: 68000, estimatedTokensAfter: 9000, firstKeptEntryId: 'e2' }), 5);
+    },
+    async navigateTree(id, options) {
+      calls.navigate.push({ id, options });
+      return { cancelled: false };
+    },
     ui: {
       notes: [],
       confirms: [],
@@ -81,6 +103,7 @@ function fakePi({ reply = 'the answer is 42', delayMs = 0, toolCalls = [] } = {}
   const pi = {
     sent,
     ctx,
+    calls,
     commands,
     handlers,
     on(event, fn) {
@@ -107,6 +130,8 @@ test('pi-bridge end to end: connect, work, gate, disconnect', async (t) => {
   const stateDir = await mkdtemp(path.join(tmpdir(), 'pi-bridge-state-'));
   const workDir = await mkdtemp(path.join(tmpdir(), 'pi-bridge-work-'));
   await writeFile(path.join(workDir, 'notes.txt'), 'alpha\nbeta\ngamma\n');
+  // macOS realpaths /var → /private/var, and the extension resolves the root.
+  const realWorkDir = await realpath(workDir);
 
   const relay = spawn(process.execPath, ['server/index.mjs'], {
     cwd: ROOT,
@@ -191,6 +216,31 @@ test('pi-bridge end to end: connect, work, gate, disconnect', async (t) => {
   assert.equal(pi.sent.length, 1);
   assert.equal(pi.sent[0].message.customType, 'pi-bridge');
   assert.match(pi.sent[0].message.content, /shares no context|cannot see this one/);
+
+  // -- pi_status reports where it is and how full the context is -------------
+  const status = await mcp('pi_status', {});
+  assert.match(textOf(status), new RegExp(`pwd\\s+${process.cwd().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), textOf(status));
+  assert.match(textOf(status), new RegExp(`root\\s+${realWorkDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(textOf(status), /context\s+68k \/ 128k tokens \(53%\)/, textOf(status));
+  assert.match(textOf(status), /busy\s+no/);
+
+  // -- pi_tree lists the branch with ids you can roll back to ----------------
+  const tree = await mcp('pi_tree', {});
+  assert.match(textOf(tree), /current leaf: e2/);
+  assert.match(textOf(tree), /e1\s+user\s+look at the failing test/);
+  assert.match(textOf(tree), /e2\s+assistant\s+the assertion is wrong\s+← current/);
+
+  // -- rollback defaults to no summary --------------------------------------
+  const rolled = await mcp('pi_tree', { entryId: 'e1' });
+  assert.match(textOf(rolled), /rolled back to e1, no summary/);
+  assert.match(textOf(rolled), /The context now ends at e2 \(assistant\): "the assertion is wrong"/);
+  assert.deepEqual(pi.calls.navigate.at(-1), { id: 'e1', options: { summarize: false } });
+
+  // -- compaction reports the before/after ----------------------------------
+  const compacted = await mcp('pi_compact', {});
+  assert.match(textOf(compacted), /context compacted: 68000 → 9000 tokens \(87% smaller\)/, textOf(compacted));
+  assert.match(textOf(compacted), /the test expects 3 but gets 4/);
+  assert.equal(pi.calls.compact.length, 1);
 
   // -- the root fence holds ---------------------------------------------------
   const escaped = await mcp('pi_read', { path: '../../etc/hostname' });

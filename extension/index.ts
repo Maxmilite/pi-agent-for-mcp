@@ -37,7 +37,7 @@ interface Config {
 
 interface Call {
 	callId: string;
-	kind: "ask" | "exec" | "read" | "write" | "edit" | "abort" | "status";
+	kind: "ask" | "exec" | "read" | "write" | "edit" | "abort" | "status" | "compact" | "tree";
 	args: Record<string, any>;
 	taskId?: string | null;
 }
@@ -256,6 +256,163 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * Live facts the relay cannot know: where pi actually is, and how full the
+	 * context is. Answered even while a task is running, so a status request
+	 * never queues behind five minutes of work.
+	 */
+	const runStatus = (ctx: ExtensionContext | null) => {
+		if (!ctx) fail("Not connected to a pi session.");
+		const usage = (ctx as any).getContextUsage?.() ?? null;
+		const sm = (ctx as any).sessionManager;
+		const model = (ctx as any).model;
+		return {
+			pwd: process.cwd(),
+			root: state.root,
+			mode: state.mode,
+			model: model ? `${model.provider}/${model.id}` : null,
+			sessionName: pi.getSessionName?.() ?? null,
+			sessionFile: sm?.getSessionFile?.() ?? null,
+			entries: sm?.getEntryCount?.() ?? null,
+			busy: !ctx.isIdle(),
+			context: usage
+				? { tokens: usage.tokens, window: usage.contextWindow, percent: usage.percent }
+				: null,
+			remote: { running: Boolean(state.currentAsk), queued: state.queue.length },
+		};
+	};
+
+	/** Compact the context and wait for the summary, since "did it work" is the whole question. */
+	const runCompact = (ctx: ExtensionContext | null, instructions?: string) => {
+		if (!ctx) fail("Not connected to a pi session.");
+		if (!ctx.isIdle()) fail("pi is busy; compaction can only run when the session is idle.");
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const timer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				reject(new Error("compaction did not finish within 10 minutes"));
+			}, 10 * 60 * 1000);
+
+			(ctx as any).compact({
+				customInstructions: instructions || undefined,
+				onComplete: (result: any) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					resolve({
+						tokensBefore: result?.tokensBefore ?? null,
+						tokensAfter: result?.estimatedTokensAfter ?? null,
+						firstKeptEntryId: result?.firstKeptEntryId ?? null,
+						summary: String(result?.summary ?? "").slice(0, 2000),
+					});
+				},
+				onError: (err: unknown) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					reject(err instanceof Error ? err : new Error(String(err)));
+				},
+			});
+		});
+	};
+
+	/**
+	 * List the current branch, or roll back to one entry on it.
+	 *
+	 * The list is the branch the session is actually on, because an entry from an
+	 * abandoned branch is not a rollback target — it is a different conversation.
+	 */
+	const runTree = async (ctx: ExtensionContext | null, args: Record<string, any>) => {
+		if (!ctx) fail("Not connected to a pi session.");
+		const sm = (ctx as any).sessionManager;
+		if (!sm) fail("This pi session has no session manager.");
+
+		if (args.entryId) {
+			if (!ctx.isIdle()) fail("pi is busy; roll back only when the session is idle.");
+			const result = await (ctx as any).navigateTree(String(args.entryId), {
+				summarize: Boolean(args.summarize),
+			});
+			if (result?.cancelled) fail("The rollback was cancelled in pi.");
+
+			// Report what the context actually ends with now, because the leaf is
+			// not always the entry that was named: rolling back to a user message
+			// puts the leaf on its parent, so that message leaves the context too.
+			const after: any[] = sm.getBranch?.() ?? [];
+			const kept = [...after]
+				.reverse()
+				.find(
+					(e) => e.type === "message" && (e.message?.role === "user" || e.message?.role === "assistant"),
+				);
+			const dropped = !after.some((e) => e.id === args.entryId);
+
+			return {
+				text:
+					`rolled back to ${args.entryId}` +
+					(args.summarize ? " with a summary of what was discarded" : ", no summary") +
+					".\n" +
+					(kept
+						? `The context now ends at ${kept.id} (${kept.message.role}): "${textOf(kept.message).replace(/\s+/g, " ").trim().slice(0, 120)}"\n`
+						: "The context holds no messages now.\n") +
+					(dropped
+						? `${args.entryId} was a user message, so it left the context as well — the next turn starts a new branch from here.\n`
+						: "") +
+					"Everything after it is gone from the context but still in the session file.\n" +
+					"Call pi_status for the new context size.",
+			};
+		}
+
+		const leaf = sm.getLeafId?.() ?? null;
+		const branch: any[] = sm.getBranch?.() ?? [];
+		const childCount = new Map<string, number>();
+		const walk = (nodes: any[]) => {
+			for (const node of nodes ?? []) {
+				childCount.set(node.entry.id, node.children?.length ?? 0);
+				walk(node.children ?? []);
+			}
+		};
+		walk(sm.getTree?.() ?? []);
+
+		const limit = Math.min(200, Math.max(1, Number(args.limit ?? 25)));
+		const rows: string[] = [];
+		let shown = 0;
+		for (const entry of [...branch].reverse()) {
+			if (shown >= limit) break;
+			const kids = childCount.get(entry.id) ?? 0;
+			const branchNote = kids > 1 ? `   (+${kids - 1} other branch)` : "";
+			const current = entry.id === leaf ? "   ← current" : "";
+			if (entry.type === "message") {
+				const role = entry.message?.role;
+				if (role !== "user" && role !== "assistant") continue;
+				const text = textOf(entry.message).replace(/\s+/g, " ").trim().slice(0, 110);
+				rows.push(`${entry.id}  ${role.padEnd(9)} ${text}${branchNote}${current}`);
+				shown++;
+			} else if (entry.type === "compaction") {
+				rows.push(`${entry.id}  compaction [context was summarised here]${branchNote}${current}`);
+				shown++;
+			}
+		}
+
+		if (!rows.length) {
+			return {
+				text:
+					`session ${sm.getSessionFile?.() ?? "(in memory)"}\n` +
+					`current leaf: ${leaf ?? "(none)"}, ${branch.length} entries\n\n` +
+					"No user or assistant messages on this branch: the session is at its beginning, or a rollback left only setup entries.",
+			};
+		}
+
+		return {
+			text:
+				`session ${sm.getSessionFile?.() ?? "(in memory)"}\n` +
+				`current leaf: ${leaf ?? "(none)"}\n` +
+				`${branch.length} entries on this branch; showing the newest ${rows.length}, newest last\n\n` +
+				`${rows.reverse().join("\n")}\n\n` +
+				"To roll back, call pi_tree with entryId set to one of the ids above. " +
+				"Everything after it leaves the context; summarize defaults to false, which keeps the context small.",
+		};
+	};
+
 	const execute = async (call: Call): Promise<unknown> => {
 		const ctx = state.ctx;
 		switch (call.kind) {
@@ -267,6 +424,15 @@ export default function (pi: ExtensionAPI) {
 				if (!(await gate(ctx, "run a command", command))) fail("The user denied this command in pi.");
 				return await runExec(call.args);
 			}
+
+			case "status":
+				return await runStatus(ctx);
+
+			case "compact":
+				return await runCompact(ctx, call.args.instructions);
+
+			case "tree":
+				return await runTree(ctx, call.args);
 
 			case "read":
 				return await runRead(call.args);
@@ -321,6 +487,14 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	const answerNow = async (call: Call) => {
+		try {
+			await reply(call.callId, { ok: true, result: await runStatus(state.ctx) });
+		} catch (err) {
+			await reply(call.callId, { ok: false, error: msg(err) });
+		}
+	};
+
 	const handleAbort = async (call: Call) => {
 		if (state.currentAsk) {
 			state.ctx?.abort();
@@ -366,7 +540,10 @@ export default function (pi: ExtensionAPI) {
 				const { calls } = (await res.json()) as { calls: Call[] };
 				state.failures = 0;
 				for (const call of calls ?? []) {
+					// Control calls must not queue behind a running task: an abort or
+					// a status request is only useful now.
 					if (call.kind === "abort") void handleAbort(call);
+					else if (call.kind === "status") void answerNow(call);
 					else {
 						state.queue.push(call);
 						void drain();

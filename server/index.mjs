@@ -207,6 +207,8 @@ const buildServer = () => {
       instructions:
         'Drives a pi coding agent running on the user\'s own machine. Prefer pi_ask for almost everything; ' +
         'the file and shell tools are escape hatches for when you need exact bytes or one deterministic command. ' +
+        'pi_status reports the working directory and how full the context is; pi_compact summarises the history ' +
+        'when it fills up, and pi_tree rolls the session back to an earlier point. ' +
         'If a call fails with "No local pi is connected", tell the user to run /connect in pi.',
     },
   );

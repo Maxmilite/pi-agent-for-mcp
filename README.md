@@ -34,11 +34,25 @@ work out why"* finishes in one call instead of fifteen.
 |---|---|
 | `pi_ask` | **preferred.** Hand a task to the local agent; get a finished answer |
 | `pi_task` | collect an `pi_ask`/`pi_exec` that outlived its wait window; `abort` stops it |
-| `pi_status` | which agents are connected, where, and what they are busy with |
+| `pi_status` | pwd, model, **context tokens used**, busy state, session file |
+| `pi_compact` | summarise the session's context — `/compress` on the far side |
+| `pi_tree` | list the current branch, or roll the session back to an entry |
 | `pi_exec` | *not recommended* — one deterministic command, when you need exact output |
 | `pi_read` | *not recommended* — verbatim text with line numbers, for exact bytes |
 | `pi_write` | *not recommended* — whole-file replace, when you already hold the text |
 | `pi_edit` | *not recommended* — exact-snippet replace, to fix something `pi_ask` nearly got right |
+
+`pi_compact` and `pi_tree` exist because a session that is driven remotely fills
+up and goes wrong in ways a chat window cannot see. `pi_status` reports the
+context window so a nearly-full session is visible before it fails, `pi_compact`
+compacts it on demand, and `pi_tree` rolls back to an entry id — with
+`summarize: false` by default, since the point of rolling back is a smaller
+context.
+
+One asymmetry is worth knowing: rolling back to a **user** message removes that
+message too (so it can be re-sent differently), while rolling back to an
+**assistant** message keeps it. The reply says which happened and what the
+context now ends with.
 
 The last four exist because a summary is sometimes not good enough: you cannot
 quote a line number out of a summary, and re-asking for the whole task because

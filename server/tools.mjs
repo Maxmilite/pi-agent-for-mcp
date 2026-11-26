@@ -31,11 +31,28 @@ const waitArg = z
   .optional()
   .describe('Seconds to wait for a result before returning a task id. Defaults to 45. Raise it for a known-slow command rather than polling.');
 
+/** Tokens, in units a human reads without counting zeros. */
+const tokens = (n) => {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) {
+    const k = n / 1000;
+    return `${Number.isInteger(k) ? k : k.toFixed(1)}k`;
+  }
+  const m = n / 1_000_000;
+  return `${Number.isInteger(m) ? m : m.toFixed(2)}M`;
+};
+
 const bytes = (n) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 
 /** Render whatever the agent sent back into something readable in a chat window. */
 function render(kind, result) {
   if (result == null) return '(no output)';
+  if (kind === 'compact') {
+    const before = result.tokensBefore ?? '?';
+    const after = result.tokensAfter ?? '?';
+    const saved = typeof before === 'number' && typeof after === 'number' ? ` (${Math.max(0, Math.round((1 - after / before) * 100))}% smaller)` : '';
+    return `context compacted: ${before} → ${after} tokens${saved}\nkept from entry ${result.firstKeptEntryId ?? '?'}\n\n${String(result.summary ?? '').slice(0, 1500)}`;
+  }
   if (kind === 'exec') {
     const parts = [];
     if (result.stdout?.trim()) parts.push(result.stdout.replace(/\s+$/, ''));
@@ -49,6 +66,24 @@ function render(kind, result) {
 }
 
 export function registerTools(server, { hub, config, log = () => {} }) {
+  /**
+   * Ask a connected agent something and wait briefly, without registering a task.
+   * Used for status, where "the agent did not answer" is itself an answer.
+   */
+  const quickCall = async (name, kind, args = {}, waitMs = 5_000) => {
+    try {
+      const { done } = hub.issue({ agent: name, kind, args, taskId: null, waitMs: 0 });
+      const outcome = await Promise.race([
+        done,
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), waitMs).unref?.()),
+      ]);
+      if (outcome.timeout || outcome.ok === false) return null;
+      return outcome.result;
+    } catch {
+      return null;
+    }
+  };
+
   /**
    * One path for every call: resolve the agent, register a task, hand it over,
    * and translate the three possible endings (answer, failure, still-running)
@@ -137,43 +172,123 @@ export function registerTools(server, { hub, config, log = () => {} }) {
   server.registerTool(
     'pi_status',
     {
-      title: 'Which local agents are connected',
+      title: 'Where the agents are and how full their context is',
       description:
-        'List the connected local pi agents, their working directory, and what they are busy with. ' +
-        'Call this first whenever you are unsure which agent to address, or when a call failed because none was connected.',
+        'Live state of a connected agent: its working directory, the context window it has used, what it is busy with, and the session it belongs to. ' +
+        'Call this before a long task, when a call failed because nothing was connected, or when you suspect the context is filling up — ' +
+        'a nearly full context is what pi_compact is for.',
       inputSchema: {
         agent: agentArg,
       },
     },
-    ({ agent }) => {
+    async ({ agent }) => {
       const agents = hub.list();
       if (!agents.length) {
         return text('No local pi is connected right now. Ask the user to run /connect in a pi session.');
       }
-      if (agent) {
-        const one = hub.pick(agent);
-        const info = agents.find((a) => a.name === one);
+
+      // Listing every agent is a relay question; the detail is only worth a round
+      // trip when there is one clear target.
+      if (!agent && agents.length > 1) {
         return text(
-          [
-            `agent ${info.name}`,
-            `  cwd      ${info.cwd || '?'}`,
-            `  model    ${info.model || '?'}`,
-            `  up       ${Math.round((Date.now() - info.connectedAt) / 1000)}s`,
-            `  queued   ${info.queued}`,
-            `  running  ${info.tasks}`,
-          ].join('\n'),
+          agents
+            .map(
+              (a) =>
+                `${a.name}  ${a.cwd || '?'}  [${a.model || '?'}]` +
+                `${a.tasks ? `  ${a.tasks} task(s) running` : ''}${a.queued ? `  ${a.queued} queued` : ''}`,
+            )
+            .join('\n') + `\n\nPass agent to see one in detail.`,
         );
       }
-      return text(
-        agents
-          .map(
-            (a) =>
-              `${a.name}  ${a.cwd || '?'}  [${a.model || '?'}]` +
-              `${a.tasks ? `  ${a.tasks} task(s) running` : ''}${a.queued ? `  ${a.queued} queued` : ''}`,
-          )
-          .join('\n'),
-      );
+
+      const name = hub.pick(agent);
+      const info = agents.find((a) => a.name === name);
+      const live = await quickCall(name, 'status');
+
+      const rows = [`agent ${name}`];
+      if (live) {
+        rows.push(`  pwd        ${live.pwd}`);
+        if (live.root !== live.pwd) rows.push(`  root       ${live.root}   (pi_exec runs here; pi_read/write are fenced to it)`);
+        rows.push(`  model      ${live.model ?? info.model ?? '?'}`);
+        if (live.sessionName) rows.push(`  session    ${live.sessionName}`);
+        if (live.sessionFile) rows.push(`  file       ${live.sessionFile}`);
+        if (live.entries != null) rows.push(`  entries    ${live.entries}`);
+
+        const c = live.context;
+        if (!c) rows.push('  context    unknown');
+        else if (c.tokens == null) rows.push(`  context    ${c.window.toLocaleString()} tokens available (usage unknown — just compacted, or nothing sent yet)`);
+        else {
+          const used = tokens(c.tokens);
+          const win = tokens(c.window);
+          const pct = c.percent != null ? `${Math.round(c.percent)}%` : '?';
+          const warning = c.percent != null && c.percent >= 75 ? '   ← getting full; pi_compact will summarise it' : '';
+          rows.push(`  context    ${used} / ${win} tokens (${pct})${warning}`);
+        }
+        rows.push(`  busy       ${live.busy ? `yes — ${live.remote.running ? 'running a remote task' : 'working on local input'}` : 'no'}${live.remote.queued ? `, ${live.remote.queued} queued` : ''}`);
+        rows.push(`  mode       ${live.mode}`);
+      } else {
+        rows.push(`  cwd        ${info.cwd || '?'}`);
+        rows.push(`  model      ${info.model || '?'}`);
+        rows.push(`  busy       ${info.tasks ? `${info.tasks} task(s) running` : 'idle'}${info.queued ? `, ${info.queued} queued` : ''}`);
+        rows.push('');
+        rows.push('  The agent did not answer within 5s, so this is relay-side state only.');
+      }
+      rows.push(`  up         ${Math.round((Date.now() - info.connectedAt) / 1000)}s`);
+      return text(rows.join('\n'));
     },
+  );
+
+  server.registerTool(
+    'pi_compact',
+    {
+      title: "Summarise the session's context",
+      description:
+        "Replace the agent's conversation history with a summary and carry on from it — the same operation as /compress in pi. " +
+        'Use it when pi_status shows the context nearly full, or before a long task that would otherwise run out of room. ' +
+        'It calls a model, so it takes tens of seconds; the result reports tokens before and after.',
+      inputSchema: {
+        instructions: z.string().optional().describe('What the summary must preserve, e.g. "keep the file paths and the failing test names"'),
+        agent: agentArg,
+        waitSec: waitArg,
+      },
+    },
+    ({ instructions, agent, waitSec }) =>
+      dispatch({
+        agent,
+        kind: 'compact',
+        args: { instructions },
+        summary: 'compact the context',
+        waitSec: waitSec ?? 120,
+      }),
+  );
+
+  server.registerTool(
+    'pi_tree',
+    {
+      title: 'Inspect the session tree, or roll back',
+      description:
+        "With no entryId: list the entries on the agent's current branch, newest last, with the ids you can roll back to. " +
+        'With an entryId: move the session back to that point, dropping everything after it from the context ' +
+        '(the abandoned branch stays in the session file, so it can be recovered in pi). ' +
+        'summarize defaults to false — that is usually what you want, since the point of rolling back is a smaller context. ' +
+        'Rolling back to a user message removes that message too, so it can be re-sent differently; rolling back to an assistant message keeps it. ' +
+        'Only entries on the current branch are valid targets; an entry from an abandoned branch is a different conversation.',
+      inputSchema: {
+        entryId: z.string().optional().describe('The entry to roll back to. Omit to list the branch instead.'),
+        summarize: z.boolean().optional().describe('Leave a summary of the discarded branch behind. Defaults to false.'),
+        limit: z.number().int().min(1).max(200).optional().describe('How many entries to list. Defaults to 25, newest first.'),
+        agent: agentArg,
+        waitSec: waitArg,
+      },
+    },
+    ({ entryId, summarize, limit, agent, waitSec }) =>
+      dispatch({
+        agent,
+        kind: 'tree',
+        args: { entryId, summarize, limit },
+        summary: entryId ? `roll back to ${entryId}` : 'list the session tree',
+        waitSec,
+      }),
   );
 
   server.registerTool(
