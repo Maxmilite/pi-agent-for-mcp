@@ -1,0 +1,20 @@
+{
+  "name": "pi-bridge",
+  "version": "0.1.0",
+  "description": "Let a remote MCP client (ChatGPT) drive a local Pi session: /connect in pi, then pi_ask / pi_exec / pi_read from the other side.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch server/index.mjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "express": "^4.21.2",
+    "zod": "^3.24.1"
+  },
+  "license": "MIT"
+}
