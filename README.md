@@ -118,7 +118,7 @@ enough), and a laptop with pi installed.
 ```bash
 sudo useradd --system --home /var/lib/pi-bridge --shell /usr/sbin/nologin pi-bridge
 sudo mkdir -p /opt/pi-bridge /etc/pi-bridge
-sudo tar -xzf pi-bridge.tar.gz -C /opt/pi-bridge   # or: git clone … /opt/pi-bridge
+sudo git clone https://github.com/Maxmilite/pi-agent-for-mcp /opt/pi-bridge
 cd /opt/pi-bridge && sudo npm install --omit=dev
 
 sudo cp deploy/pi-bridge.env.example /etc/pi-bridge/pi-bridge.env
